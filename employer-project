@@ -1,0 +1,334 @@
+package com.allstatebenefits.employerdim
+
+import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.functions.{col, from_json, lit, trim}
+import com.allstatebenefits.employerdim.loadEmployer.log
+
+object employerDimension {
+
+  def employer(data:DataFrame,jsonFieldName:String,spark: SparkSession):DataFrame ={
+
+    log.info("! Reading Genelco Records !")
+    val genDf= data.filter("source_nm = 'GENELCO'")
+    val genInd = genDf.count()
+    if(genInd == 0){
+      log.info("! No Genelco Data found for the given Cycle Date !")
+    }
+    log.info("! Reading L70 Records !")
+    val life70Df= data.filter("source_nm = 'L70'")
+    val l70Ind = life70Df.count()
+    if(l70Ind == 0){
+      log.info("! No L70 Data found for the given Cycle Date !")
+    }
+    var resDf = spark.emptyDataFrame
+
+    if(genInd != 0 && l70Ind != 0)
+    {
+      val genFinalDf = employerGen(genDf,jsonFieldName,spark)
+      val l70FinalDf = employerL70(life70Df,jsonFieldName,spark)
+      resDf = genFinalDf.union(l70FinalDf).toDF
+    }
+    else if (genInd != 0 && l70Ind == 0)
+    {
+      resDf = employerGen(genDf,jsonFieldName,spark)
+
+    }
+    else if (genInd == 0 && l70Ind != 0)
+    {
+     resDf = employerL70(life70Df,jsonFieldName,spark)
+
+    }
+   resDf
+
+  }
+
+  def employerGen(genDf:DataFrame,jsonFieldName:String,spark: SparkSession):DataFrame={
+    import spark.implicits._
+    val jsonGenDf = spark.read.json(genDf.select(jsonFieldName).as[String])
+    val srcGenDf = genDf.withColumn(jsonFieldName, from_json($"$jsonFieldName", jsonGenDf.schema))
+    srcGenDf.createOrReplaceTempView("genelco")
+
+    log.info("! Flatten employer_document.groupBenefitAgreement.groupAccountDetails.groupAccountBillingAgent node !")
+    spark.udf.register("zip", (xs: Seq[String],
+                               ys: Seq[String],
+                               ms: Seq[String],
+                               ns: Seq[String],
+                               qs: Seq[String],
+                               us: Seq[String]) => xs.zip(ys).zip(ms).zip(ns).zip(qs).zip(us))
+
+    val groupAccBillAgnt = spark.sql("""select  gba._1._1._1._1._1 billAgentGrp_nbr,
+                                            gba._1._1._1._1._2 writingAgentNbr,
+                                            cycle_dt cycle_dt6,
+                                            gba._1._1._1._2 agentLevel,
+                                            gba._1._1._2 writingAgentPercent,
+                                            gba._1._2 billAgentTerminationDate,
+                                            gba._2  billAgentaccountNbr
+                                            from
+                                                (select source_nm,
+                                                        cycle_dt,
+                                                        explode(zip(ty.groupNbr,ty.writingAgentNbr,ty.agentLevel,ty.writingAgentPercent,ty.TerminationDate,ty.accountNbr)) gba from genelco
+                                                        lateral view explode(employer_document.groupBenefitAgreement.groupAccountDetails.groupAccountBillingAgent) t as ty) as tab """).dropDuplicates()
+
+    log.info("! Flatten employer_document.groupBenefitAgreement.groupAccountDetails.groupAccountProductPlan node !")
+    spark.udf.register("zip2", (xs: Seq[String],
+                                ys: Seq[String],
+                                ms: Seq[String]) => xs.zip(ys).zip(ms))
+    val groupAccProductPlan=spark.sql("""select cycle_dt cycle_dt5,
+                                          gap._1._1 ProductAccountNbr,
+                                          gap._1._2 ProductGroupNbr,
+                                          gap._2 productId
+                                          from
+                                              (select explode(zip2(plan.accountNbr,plan.groupNbr,plan.productId)) gap,
+                                                      cycle_dt from genelco
+                                                      lateral view explode(employer_document.groupBenefitAgreement.groupAccountDetails.groupAccountProductPlan) t as plan) as tab2""").dropDuplicates()
+
+
+    log.info("! Flatten employer_document.groupBenefitAgreement.groupAccountDetails.groupAddress node !")
+    spark.udf.register("zip3", (xs: Seq[String],
+                                ys: Seq[String],
+                                ms: Seq[String],
+                                js: Seq[String],
+                                lp: Seq[String],
+                                op: Seq[String],
+                                lk: Seq[String]) => xs.zip(ys).zip(ms).zip(js).zip(lp).zip(op).zip(lk))
+    val groupAccAddr =spark.sql("""select cycle_dt cycle_dt7,
+                                            gad._1._1._1._1._1._1 accAdrlAccountNbr,
+                                            gad._1._1._1._1._1._2 accAdrlGroupNbr,
+                                            gad._1._1._1._1._2 accAddrCity,
+                                            gad._1._1._1._2 accAddrEmailAddress,
+                                            gad._1._1._2 accAddrStateCode,
+                                            gad._1._2 accAddrTelephone,
+                                            gad._2 accAddrZipCode
+                                            from
+                                              (select explode(zip3(grpAdd.adrlAccountNbr,grpAdd.adrlGroupNbr,grpAdd.addrCity,grpAdd.addrEmailAddress,grpAdd.addrStateCode,grpAdd.addrTelephone,grpAdd.addrZipCode)) gad,
+                                                      cycle_dt from genelco
+                                                      lateral view explode(employer_document.groupBenefitAgreement.groupAccountDetails.groupAddress) t as grpAdd) as  tab """).dropDuplicates()
+
+
+    log.info("! Flatten employer_document.groupBenefitAgreement.groupAccountDetails node !")
+    val groupAccDetails =spark.sql("""select cycle_dt cycle_dt2,
+                                                  tab.accountNbr,
+                                                  tab.groupNbr accgroupNbr,
+                                                  tab.caseIdentifier,
+                                                  tab.contName,
+                                                  tab.creditUnion,
+                                                  tab.cycleOpenedOnDate,
+                                                  tab.ebillCode,
+                                                  tab.eDelivery,
+                                                  tab.effectiveDate accEffectiveDt,
+                                                  tab.form,
+                                                  tab.generalAgent,
+                                                  tab.groupSalesCode,
+                                                  tab.industryCode,
+                                                  tab.mail,
+                                                  tab.maintByDesk,
+                                                  cast(tab.numberLivesAtIssue as string),
+                                                  tab.prestName,
+                                                  tab.reinCompany,
+                                                  tab.reinType,
+                                                  tab.retainPct,
+                                                  explode(tab.SicCode) SicCode,
+                                                  tab.terminationDate accTerminationDate,
+                                                  cast(tab.terminateReasonCode as string),
+                                                  tab.thirdParty from  genelco
+                                                  lateral view explode(employer_document.groupBenefitAgreement.groupAccountDetails) as tab""").withColumn("accountNbr",trim(col("accountNbr"))).dropDuplicates()
+
+    log.info("! Flatten employer_document.groupBenefitAgreement node !")
+    val groupBenAgr=spark.sql("""select source_nm,
+                                                  cast(cycle_dt as string),
+                                                  employer_document.groupBenefitAgreement.groupName,
+                                                  employer_document.groupBenefitAgreement.groupNbr,
+                                                  employer_document.groupBenefitAgreement.terminationDate groupTerminationDate,
+                                                  employer_document.groupBenefitAgreement.companyCode,
+                                                  employer_document.groupBenefitAgreement.effectiveDate groupEffectiveDate,
+                                                  employer_document.groupBenefitAgreement.employerId,
+                                                  employer_document.groupBenefitAgreement.RatingSicCode,
+                                                  employer_document.groupBenefitAgreement.userNumericField[1] userNumericField
+                                                  from genelco """).dropDuplicates()
+
+    log.info("! Flatten employer_document.groupBenefitAgreement.groupAddress node !")
+    val groupAddr=spark.sql("""select cycle_dt cycle_dt3,
+                                        tab.addrCity groupAddrCity,
+                                        tab.addrEmailAddress groupAddremailaddress,
+                                        tab.addrStateCode groupAddrstatecode,
+                                        tab.addrZipCode groupAddrzipcode,
+                                        tab.adrlGroupNbr adrlGroupNbr,
+                                        tab.addrTelephone groupAddrTelephone
+                                        from genelco
+                                        lateral view explode(employer_document.groupBenefitAgreement.groupAddress) as tab """).dropDuplicates()
+
+
+    log.info("! Join all nodes for Genelco !")
+    val joinDf=groupBenAgr.join(groupAccDetails,groupBenAgr.col("groupNbr")=== groupAccDetails("accgroupNbr") && groupBenAgr.col("cycle_dt")=== groupAccDetails("cycle_dt2"),"left")
+      .join(groupAddr,groupBenAgr.col("groupNbr") === groupAddr.col("adrlGroupNbr") && groupBenAgr.col("cycle_dt") === groupAddr.col("cycle_dt3"),"left")
+      .join(groupAccProductPlan,groupAccDetails.col("accgroupNbr")===groupAccProductPlan.col("ProductGroupNbr") && groupAccDetails.col("accountNbr")===groupAccProductPlan.col("ProductAccountNbr") && groupAccDetails.col("cycle_dt2")===groupAccProductPlan.col("cycle_dt5"),"left")
+      .join(groupAccBillAgnt,groupAccDetails.col("accgroupNbr")===groupAccBillAgnt.col("billAgentGrp_nbr") && groupAccDetails.col("accountNbr")===groupAccBillAgnt.col("billAgentaccountNbr") && groupAccDetails.col("cycle_dt2")===groupAccBillAgnt.col("cycle_dt6"),"left")
+      .join(groupAccAddr,groupAccDetails.col("accgroupNbr")===groupAccAddr.col("accAdrlGroupNbr") && groupAccDetails.col("accountNbr")===groupAccAddr.col("accAdrlAccountNbr") && groupAccDetails.col("cycle_dt2")===groupAccAddr.col("cycle_dt7"),"left")
+
+    val resGenDf=joinDf.drop("billAgentGrp_nbr","numericGroupNbr","billAgentaccountNbr","ProductAccountNbr","ProductGroupNbr","accAdrlAccountNbr","accAdrlGroupNbr","adrlGroupNbr","accgroupNbr","cycle_dt2","cycle_dt3","cycle_dt5","cycle_dt6","cycle_dt7")
+
+    val genFinalDf =resGenDf.select("cycle_dt",
+                                    "source_nm",
+                                    "groupName",
+                                    "groupNbr",
+                                    "groupTerminationDate",
+                                    "companyCode",
+                                    "groupEffectiveDate",
+                                    "employerId",
+                                    "ratingSicCode",
+                                    "accountNbr",
+                                    "caseIdentifier",
+                                    "contName",
+                                    "creditUnion",
+                                    "cycleOpenedOnDate",
+                                    "ebillCode",
+                                    "eDelivery",
+                                    "accEffectiveDt",
+                                    "form",
+                                    "generalAgent",
+                                    "groupSalesCode",
+                                    "industryCode",
+                                    "mail",
+                                    "maintByDesk",
+                                    "numberLivesAtIssue",
+                                    "prestName",
+                                    "Reincompany",
+                                    "Reintype",
+                                    "Retainpct",
+                                    "Siccode",
+                                    "accTerminationDate",
+                                    "terminateReasonCode",
+                                    "Thirdparty",
+                                    "writingAgentNbr",
+                                    "agentLevel",
+                                    "writingAgentPercent",
+                                    "billAgentTerminationDate",
+                                    "productId",
+                                    "accAddrCity",
+                                    "accAddrEmailAddress",
+                                    "accAddrStateCode",
+                                    "accAddrTelephone",
+                                    "accAddrZipCode",
+                                    "groupAddrCity",
+                                    "groupAddremailaddress",
+                                    "groupAddrstatecode",
+                                    "groupAddrzipcode",
+                                    "groupAddrTelephone",
+                                    "userNumericField")
+
+    genFinalDf
+  }
+
+  def employerL70(life70Df:DataFrame,jsonFieldName:String,spark: SparkSession):DataFrame={
+    import spark.implicits._
+    val jsonL70Df = spark.read.json(life70Df.select(jsonFieldName).as[String])
+    val srcL70Df = life70Df.withColumn(jsonFieldName, from_json($"$jsonFieldName", jsonL70Df.schema))
+    srcL70Df.createOrReplaceTempView("life70")
+
+    log.info("! Flattening Life 70 records !")
+    val resL70Df = spark.sql("""select cast(cycle_dt as string),
+                       source_nm,
+                       employer_document.groupBenefitAgreement.groupName,
+                       employer_document.groupBenefitAgreement.groupNbr groupNbr,
+                       employer_document.groupBenefitAgreement.terminationDate groupTerminationDate,
+                       employer_document.groupBenefitAgreement.companyCode,
+                       employer_document.groupBenefitAgreement.effectiveDate groupEffectiveDate,
+                       employer_document.groupBenefitAgreement.employerId,
+                       employer_document.groupBenefitAgreement.ratingSicCode,
+                       employer_document.groupBenefitAgreement.userNumericField,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.accountNbr,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.caseIdentifier,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.contName,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.creditUnion,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.cycleOpenedOnDate,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.ebillCode,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.eDelivery,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.effectiveDate accEffectiveDt,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.form,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.generalAgent,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.groupSalesCode,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.industryCode,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.mail,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.maintByDesk,
+                       cast(employer_document.groupBenefitAgreement.groupAccountDetails.numberLivesAtIssue as string),
+                       employer_document.groupBenefitAgreement.groupAccountDetails.prestName,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.reinCompany,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.reinType,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.retainPct,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.SicCode,
+                       employer_document.groupBenefitAgreement.groupAccountDetails.terminationDate accTerminationDate,
+                       cast(employer_document.groupBenefitAgreement.groupAccountDetails.terminateReasonCode as string),
+                       employer_document.groupBenefitAgreement.groupAccountDetails.thirdParty,
+                       saw.addrCity groupAddrCity,
+                       saw.addrEmailAddress groupAddremailaddress,
+                       saw.addrStateCode groupAddrstatecode,
+                       saw.addrZipCode groupAddrzipcode,
+                       saw.addrTelephone groupAddrTelephone,
+                       gab2.writingAgentNbr,
+                       gab2.agentLevel,
+                       gab2.writingAgentPercent,
+                       gab2.TerminationDate billAgentTerminationDate,
+                       gap2.productId
+                       from life70 lateral view explode (employer_document.groupBenefitAgreement.groupAddress) see as saw
+                       lateral view explode (employer_document.groupBenefitAgreement.groupAccountDetails.groupAccountBillingAgent) gab as gab2
+                       lateral view explode (employer_document.groupBenefitAgreement.groupAccountDetails.groupAccountProductPlan) gap as gap2 """
+    ).dropDuplicates
+      .withColumn("accAddrCity",lit(""))
+      .withColumn("accAddrEmailAddress",lit(""))
+      .withColumn("accAddrStateCode",lit(""))
+      .withColumn("accAddrTelephone",lit(""))
+      .withColumn("accAddrZipCode",lit(""))
+
+
+    val l70FinalDf= resL70Df.select( "cycle_dt",
+                                      "source_nm",
+                                      "groupName",
+                                      "groupNbr",
+                                      "groupTerminationDate",
+                                      "companyCode",
+                                      "groupEffectiveDate",
+                                      "employerId",
+                                      "ratingSicCode",
+                                      "accountNbr",
+                                      "caseIdentifier",
+                                      "contName",
+                                      "creditUnion",
+                                      "cycleOpenedOnDate",
+                                      "ebillCode",
+                                      "eDelivery",
+                                      "accEffectiveDt",
+                                      "form",
+                                      "generalAgent",
+                                      "groupSalesCode",
+                                      "industryCode",
+                                      "mail",
+                                      "maintByDesk",
+                                      "numberLivesAtIssue",
+                                      "prestName",
+                                      "Reincompany",
+                                      "Reintype",
+                                      "Retainpct",
+                                      "Siccode",
+                                      "accTerminationDate",
+                                      "terminateReasonCode",
+                                      "Thirdparty",
+                                      "writingAgentNbr",
+                                      "agentLevel",
+                                      "writingAgentPercent",
+                                      "billAgentTerminationDate",
+                                      "productId",
+                                      "accAddrCity",
+                                      "accAddrEmailAddress",
+                                      "accAddrStateCode",
+                                      "accAddrTelephone",
+                                      "accAddrZipCode",
+                                      "groupAddrCity",
+                                      "groupAddremailaddress",
+                                      "groupAddrstatecode",
+                                      "groupAddrzipcode",
+                                      "groupAddrTelephone",
+                                      "userNumericField")
+
+    l70FinalDf
+  }
+}
