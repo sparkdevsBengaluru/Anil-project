@@ -1,0 +1,133 @@
+package com.allstatebenefits.employerdim
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+import scala.io.Source
+
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.FileSystem
+import org.apache.log4j.{FileAppender, Level, Logger, PatternLayout}
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.{DataFrame, SparkSession}
+import com.allstatebenefits.employerdim.employerDimension._
+
+object loadEmployer {
+  val log: Logger = Logger.getLogger(this.getClass)
+  val layout = new PatternLayout()
+  layout.setConversionPattern("%d{MM/dd/yyyy HH:mm:ss} %p %c{2}: %m%n")
+  Logger.getLogger("org.apache.spark").setLevel(Level.WARN)
+  Logger.getLogger("org.apache.spark.storage.BlockManager").setLevel(Level.ERROR)
+  log.setLevel(Level.INFO)
+
+  val spark: SparkSession = SparkSession.builder().appName("Dimension").getOrCreate()
+
+  import spark.implicits._
+
+  spark.sparkContext.hadoopConfiguration.set("mapreduce.fileoutputcommitter.marksuccessfuljobs", "false")
+  spark.sparkContext.hadoopConfiguration.set("parquet.enable.summary-metadata", "false")
+  val confHdp: Configuration = spark.sparkContext.hadoopConfiguration
+  val fileSys: FileSystem = org.apache.hadoop.fs.FileSystem.get(confHdp)
+  var status = 0
+
+  def main(args: Array[String]): Unit = {
+    if (args.length != 7 || args.contains(null)) {
+      log.error("########## Incorrect Parameters passed to Spark Program ##########")
+      System.exit(1)
+    }
+    try
+    {
+      val cimHdfs = args(0)
+      val jsonFieldName = args(1)
+      val outbdHdfs = args(2)
+      val outbdDB = args(3)
+      val logFile = args(4)
+      val lastProcDtFile = args(5)
+      val outbdemp = args(6)
+
+      val appender = new FileAppender(layout, logFile, true)
+      log.addAppender(appender)
+
+      log.info("# Start: Reading Employer CIM Data #")
+      val bufferedSource = Source.fromFile(lastProcDtFile)
+      val lastProcDt = bufferedSource.getLines.mkString
+      bufferedSource.close
+      log.info(s"! Getting Data with record_ts:$lastProcDt !")
+      val srcDataDf = spark.read.parquet(cimHdfs).filter($"record_ts".equalTo(lit(lastProcDt))).filter("mod_ty_cd == 'I'")
+      if (srcDataDf.count == 0) {
+        log.info(s"! No Data with record_ts:$lastProcDt !")
+        System.exit(1)
+      }
+      log.info("# End: Reading Employer CIM Data #")
+
+      val srcCount = srcDataDf.select("grp_nbr","source_nm").distinct().count()
+
+       log.info("# Start: Create Employer Dimension #")
+      var empDimDF = employer(srcDataDf,jsonFieldName,spark)
+      log.info("! Employer Dimension flattened successfully !")
+      dimensionValidation(srcCount,empDimDF)
+      log.info("! Employer Dimension Balanced successfully !")
+      empDimDF = createPartition(empDimDF)
+      log.info(s"! Employer Dimension Dataframe partitioned successfully !")
+      val empDimHdfs = outbdHdfs + outbdemp
+      val empDimTbl = "avt_" + outbdemp
+      writeHive(empDimDF,outbdDB,empDimTbl,empDimHdfs)
+      log.info("# End: Create Employer Dimension #")
+    }
+    catch
+      {
+        case e: Exception =>
+          log.error("Failed to execute the program. Please check the error message :  ")
+          log.error(e.getMessage)
+          status = 1
+      }
+    finally
+    {
+      spark.stop()
+      System.exit(status)
+    }
+  }
+
+
+  def dimensionValidation(srcCount:Long,dimDf:DataFrame): Unit =
+  {
+    val dimCount = dimDf.select("groupNbr","source_nm").distinct().count()
+
+    if (srcCount != dimCount )
+    {
+      log.info(s"! CIM count = $srcCount")
+      log.info(s"! DIM count = $dimCount")
+      log.info(s"! Failed - Count mismatch between Employer CIM and Dimension !")
+      System.exit(1)
+    }
+    log.info(s"! Pass - Count matched between Employer CIM and Dimension !")
+  }
+
+  def createPartition(EmployerDF: DataFrame): DataFrame = {
+
+    var flattenDF = EmployerDF.withColumn("reportCycleDt", lit(EmployerDF("cycle_dt")))
+    val split_col = split(flattenDF("reportCycleDt"), "-")
+    flattenDF = flattenDF.withColumn("loadyear", split_col(0)).withColumn("loadmonth", split_col(1))
+    val record_ts = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").format(LocalDateTime.now)
+    flattenDF = flattenDF.withColumn("record_ts", lit(record_ts))
+
+    flattenDF
+  }
+
+
+  def writeHive(EmployerDF: DataFrame,outbdDB: String, hiveTblName: String, destHdfs: String  ): Unit = {
+    if (spark.catalog.tableExists(s"$outbdDB.$hiveTblName")) {
+      log.info(s"! Hive $outbdDB.$hiveTblName table already exists !")
+      EmployerDF.coalesce(1).write.mode("append").partitionBy("loadyear", "loadmonth").parquet(destHdfs)
+      log.info(s"! Data added to $destHdfs directory in HDFS !")
+      spark.catalog.recoverPartitions(s"$outbdDB.$hiveTblName")
+      log.info(s"! Hive Table $outbdDB.$hiveTblName refresh is successfull !")
+    }
+    else {
+      log.info(s"! Hive table $outbdDB.$hiveTblName does not exists, creating hive table !")
+      EmployerDF.coalesce(1).write.partitionBy("loadYear", "loadmonth")
+        .format("PARQUET").option("path", destHdfs).saveAsTable(s"$outbdDB.$hiveTblName")
+      log.info(s"! Data added to $destHdfs directory in HDFS !")
+      log.info(s"! Hive Table $outbdDB.$hiveTblName creation and refresh is successful !")
+    }
+  }
+
+}
